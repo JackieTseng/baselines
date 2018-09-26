@@ -4,7 +4,6 @@ from collections import deque
 import pickle
 
 from baselines.ddpg.ddpg import DDPG
-from baselines.ddpg.util import mpi_mean, mpi_std, mpi_max, mpi_sum
 import baselines.common.tf_util as U
 
 from baselines import logger
@@ -14,7 +13,7 @@ from mpi4py import MPI
 
 
 def train(env, nb_epochs, nb_epoch_cycles, render_eval, reward_scale, render, param_noise, actor, critic,
-    normalize_returns, normalize_observations, critic_l2_reg, actor_lr, critic_lr, action_noise, logdir,
+    normalize_returns, normalize_observations, critic_l2_reg, actor_lr, critic_lr, action_noise,
     popart, gamma, clip_norm, nb_train_steps, nb_rollout_steps, nb_eval_steps, batch_size, memory,
     tau=0.01, eval_env=None, param_noise_adaption_interval=50):
     rank = MPI.COMM_WORLD.Get_rank()
@@ -35,7 +34,7 @@ def train(env, nb_epochs, nb_epoch_cycles, render_eval, reward_scale, render, pa
         saver = tf.train.Saver()
     else:
         saver = None
-    
+
     step = 0
     episode = 0
     eval_episode_rewards_history = deque(maxlen=100)
@@ -110,7 +109,7 @@ def train(env, nb_epochs, nb_epoch_cycles, render_eval, reward_scale, render, pa
                 epoch_adaptive_distances = []
                 for t_train in range(nb_train_steps):
                     # Adapt param noise, if necessary.
-                    if memory.nb_entries >= batch_size and t % param_noise_adaption_interval == 0:
+                    if memory.nb_entries >= batch_size and t_train % param_noise_adaption_interval == 0:
                         distance = agent.adapt_param_noise()
                         epoch_adaptive_distances.append(distance)
 
@@ -138,47 +137,51 @@ def train(env, nb_epochs, nb_epoch_cycles, render_eval, reward_scale, render, pa
                             eval_episode_rewards_history.append(eval_episode_reward)
                             eval_episode_reward = 0.
 
+            mpi_size = MPI.COMM_WORLD.Get_size()
             # Log stats.
-            epoch_train_duration = time.time() - epoch_start_time
+            # XXX shouldn't call np.mean on variable length lists
             duration = time.time() - start_time
             stats = agent.get_stats()
-            combined_stats = {}
-            for key in sorted(stats.keys()):
-                combined_stats[key] = mpi_mean(stats[key])
-
-            # Rollout statistics.
-            combined_stats['rollout/return'] = mpi_mean(epoch_episode_rewards)
-            combined_stats['rollout/return_history'] = mpi_mean(np.mean(episode_rewards_history))
-            combined_stats['rollout/episode_steps'] = mpi_mean(epoch_episode_steps)
-            combined_stats['rollout/episodes'] = mpi_sum(epoch_episodes)
-            combined_stats['rollout/actions_mean'] = mpi_mean(epoch_actions)
-            combined_stats['rollout/actions_std'] = mpi_std(epoch_actions)
-            combined_stats['rollout/Q_mean'] = mpi_mean(epoch_qs)
-    
-            # Train statistics.
-            combined_stats['train/loss_actor'] = mpi_mean(epoch_actor_losses)
-            combined_stats['train/loss_critic'] = mpi_mean(epoch_critic_losses)
-            combined_stats['train/param_noise_distance'] = mpi_mean(epoch_adaptive_distances)
-
+            combined_stats = stats.copy()
+            combined_stats['rollout/return'] = np.mean(epoch_episode_rewards)
+            combined_stats['rollout/return_history'] = np.mean(episode_rewards_history)
+            combined_stats['rollout/episode_steps'] = np.mean(epoch_episode_steps)
+            combined_stats['rollout/actions_mean'] = np.mean(epoch_actions)
+            combined_stats['rollout/Q_mean'] = np.mean(epoch_qs)
+            combined_stats['train/loss_actor'] = np.mean(epoch_actor_losses)
+            combined_stats['train/loss_critic'] = np.mean(epoch_critic_losses)
+            combined_stats['train/param_noise_distance'] = np.mean(epoch_adaptive_distances)
+            combined_stats['total/duration'] = duration
+            combined_stats['total/steps_per_second'] = float(t) / float(duration)
+            combined_stats['total/episodes'] = episodes
+            combined_stats['rollout/episodes'] = epoch_episodes
+            combined_stats['rollout/actions_std'] = np.std(epoch_actions)
             # Evaluation statistics.
             if eval_env is not None:
-                combined_stats['eval/return'] = mpi_mean(eval_episode_rewards)
-                combined_stats['eval/return_history'] = mpi_mean(np.mean(eval_episode_rewards_history))
-                combined_stats['eval/Q'] = mpi_mean(eval_qs)
-                combined_stats['eval/episodes'] = mpi_mean(len(eval_episode_rewards))
+                combined_stats['eval/return'] = eval_episode_rewards
+                combined_stats['eval/return_history'] = np.mean(eval_episode_rewards_history)
+                combined_stats['eval/Q'] = eval_qs
+                combined_stats['eval/episodes'] = len(eval_episode_rewards)
+            def as_scalar(x):
+                if isinstance(x, np.ndarray):
+                    assert x.size == 1
+                    return x[0]
+                elif np.isscalar(x):
+                    return x
+                else:
+                    raise ValueError('expected scalar, got %s'%x)
+            combined_stats_sums = MPI.COMM_WORLD.allreduce(np.array([as_scalar(x) for x in combined_stats.values()]))
+            combined_stats = {k : v / mpi_size for (k,v) in zip(combined_stats.keys(), combined_stats_sums)}
 
             # Total statistics.
-            combined_stats['total/duration'] = mpi_mean(duration)
-            combined_stats['total/steps_per_second'] = mpi_mean(float(t) / float(duration))
-            combined_stats['total/episodes'] = mpi_mean(episodes)
             combined_stats['total/epochs'] = epoch + 1
             combined_stats['total/steps'] = t
-            
+
             for key in sorted(combined_stats.keys()):
                 logger.record_tabular(key, combined_stats[key])
             logger.dump_tabular()
             logger.info('')
-
+            logdir = logger.get_dir()
             if rank == 0 and logdir:
                 if hasattr(env, 'get_state'):
                     with open(os.path.join(logdir, 'env_state.pkl'), 'wb') as f:
@@ -186,4 +189,3 @@ def train(env, nb_epochs, nb_epoch_cycles, render_eval, reward_scale, render, pa
                 if eval_env and hasattr(eval_env, 'get_state'):
                     with open(os.path.join(logdir, 'eval_env_state.pkl'), 'wb') as f:
                         pickle.dump(eval_env.get_state(), f)
-
